@@ -102,6 +102,6 @@ MIT License. Do not weaponize the trash logic. Rick responsibly.
 
 ## 🧵 Authored by
 
-Captain Cubit & the Trashcan GPT
+Captain Cubit & the Trashcan
 
 > Combo Chaos – because encryption should be safe, stupid, and sometimes spiritually hilarious.
