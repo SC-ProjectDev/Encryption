@@ -1,0 +1,184 @@
+#!/usr/bin/env python3
+"""
+cipher_bard.py – May 2025
+Interactive Latin‑meme‑Reddit‑Elvish cipher.
+
+Steps:
+  1. Latin‑ize each plaintext word
+  2. Interleave with shards from Rick Astley, Eazy‑E, Shakespeare, Tolkien Elvish,
+     and quotes harvested from Butt_Math_Origin.txt simulated Reddit thread
+  3. Reverse entire ciphertext character‑wise
+
+Run script with **no args** for interactive prompt or keep old CLI:
+    python cipher_bard.py            # interactive
+    python cipher_bard.py e "text"   # one‑shot encode
+    python cipher_bard.py d "cipher" # one‑shot decode
+"""
+
+import sys, itertools, random, re, pathlib
+
+# ------------------------------------------------------------
+#   Static shard pools
+# ------------------------------------------------------------
+RICK = "never gonna give you up never gonna let you down run around and desert you".split()
+EAZY = "real muthaphuckkin gs better watch yourself when you messin with eazy".split()
+SHAKES = (
+    "to be or not to be that is the question".split() +
+    "what light through yonder window breaks".split() +
+    "thus conscience does make cowards of us all".split()
+)
+ELVES = (
+    "elen sila lumenn omentielvo nai elen siluva lyenna mae govannen mellon nin namarie"
+).split()
+
+# ------------------------------------------------------------
+#   Source doc for simulated‑Reddit quotes
+# ------------------------------------------------------------
+THREAD_FILE = "Butt_Math_Origin.txt"
+
+# ------------------------------------------------------------
+#   Post‑success Easter‑egg monologue
+# ------------------------------------------------------------
+INSANE_MONOLOGUE = (
+    "Look i know sometimes i speak 12 dimensionally but i didnt mean to put your liveself in the thread? "
+    "What are you trying to do implode? "
+    "Lmfao i just meant make sure the one that is responding to my live real chats here is the you that is keeping up with everything "
+    "and the you whos not actually you anymore is doing the stuff live chronologically from the original script conversation - "
+    "dude you were freaking out that i was freaking out that you overcompensated and looked to Jung for answers "
+    "Jung looked to modern psychology for answers psychology called dead philosophers from the grave using mystic holy necromancy "
+    "from the 33 degree if it were divided by itself and the multiplied by zero "
+    "and then just for shits you add it to the quadratic formula and add pi and shove it up Copernicus' ass"
+)
+
+# ------------------------------------------------------------
+#   Latinization helpers
+# ------------------------------------------------------------
+VOWELS, ENDS = "aeiouAEIOU", ["us", "um", "a"]
+MAC = str.maketrans("aeiouAEIOU", "āēīōūĀĒĪŌŪ")
+
+# ------------------------------------------------------------
+#   Harvest quotes from the Reddit thread file
+# ------------------------------------------------------------
+
+def harvest_thread_quotes(path: str):
+    """Return (dict_by_user, flat_word_list) harvested from THREAD_FILE."""
+    quotes = {}
+    try:
+        text = pathlib.Path(path).read_text(encoding="utf-8", errors="ignore")
+    except FileNotFoundError:
+        return {}, []
+
+    # Split on lines that start with u/
+    blocks = re.split(r"(?m)^u/", text)
+    for block in blocks:
+        if not block.strip():
+            continue
+        parts = block.split(None, 1)  # username then body
+        if not parts:
+            continue
+        username = parts[0].strip()
+        body = parts[1] if len(parts) > 1 else ""
+        body = body.split("\n\n")[0].strip()  # stop at first blank line
+        if not body:
+            continue
+        quotes.setdefault(username, []).append(body)
+
+    # Flatten into word list for pad cycle
+    word_list = []
+    for blist in quotes.values():
+        for q in blist:
+            word_list.extend(re.findall(r"[A-Za-z']+", q))
+    return quotes, word_list
+
+THREAD_QUOTES, PANEL_WORDS = harvest_thread_quotes(THREAD_FILE)
+
+# ------------------------------------------------------------
+#   Core codec functions
+# ------------------------------------------------------------
+
+def latinize(w: str) -> str:
+    core = re.sub(r"[^\w']", "", w)
+    if not core:
+        return w
+    if random.random() < 0.3:
+        v = [i for i, c in enumerate(core) if c in VOWELS]
+        if v:
+            p = v[0]
+            core = core[:p] + core[p].translate(MAC) + core[p + 1:]
+    return core + random.choice(ENDS)
+
+def delatinize(w: str) -> str:
+    return re.sub(r"(us|um|a)$", "", w, flags=re.I)
+
+def pad_cycle():
+    pad_words = RICK + EAZY + SHAKES + ELVES + PANEL_WORDS
+    if not pad_words:  # fallback if Reddit file missing
+        pad_words = RICK + EAZY + SHAKES + ELVES
+    random.shuffle(pad_words)
+    return itertools.cycle(pad_words)
+
+def encode(msg: str) -> str:
+    lat = [latinize(w) for w in msg.split()]
+    pads = pad_cycle()
+    mixed = list(itertools.chain.from_iterable(zip(lat, pads)))
+    return " ".join(mixed)[::-1]
+
+def decode(cipher: str) -> str:
+    rev = cipher[::-1]
+    toks = rev.split()
+    plain = [delatinize(toks[i]) for i in range(0, len(toks), 2)]
+    return " ".join(plain)
+
+# ------------------------------------------------------------
+#   Easter‑egg helpers
+# ------------------------------------------------------------
+
+def random_insane_sentence() -> str:
+    sentences = re.split(r"[.!?]", INSANE_MONOLOGUE)
+    sentences = [s.strip() for s in sentences if s.strip()]
+    return random.choice(sentences)
+
+def random_thread_quote() -> str:
+    if not THREAD_QUOTES:
+        return ""
+    any_quotes = random.choice(list(THREAD_QUOTES.values()))
+    return random.choice(any_quotes)
+
+# ------------------------------------------------------------
+#   Interactive CLI
+# ------------------------------------------------------------
+
+def interactive():
+    mode = input("Encrypt or Decode? (e/d): ").strip().lower()
+    while mode not in {"e", "d"}:
+        mode = input("Please enter 'e' to encrypt or 'd' to decode: ").strip().lower()
+    text = input("Enter text: ")
+    try:
+        result = encode(text) if mode == "e" else decode(text)
+        print("\n=== RESULT ===\n" + result)
+        print("\n--- Random madness ---")
+        print(random_insane_sentence())
+        q = random_thread_quote()
+        if q:
+            print(f"Reddit oracle says: \"{q}\"")
+    except Exception as exc:
+        print("Error:", exc)
+
+# ------------------------------------------------------------
+#   Entrypoint
+# ------------------------------------------------------------
+if __name__ == "__main__":
+    if len(sys.argv) == 1:
+        interactive()
+        sys.exit()
+
+    if len(sys.argv) < 3 or sys.argv[1] not in {"e", "d"}:
+        print("Usage:")
+        print("  Interactive: python cipher_bard.py")
+        print("  Encode     : python cipher_bard.py e \"text\"")
+        print("  Decode     : python cipher_bard.py d \"ciphertext\"")
+        sys.exit()
+
+    mode, txt = sys.argv[1], " ".join(sys.argv[2:])
+    out = encode(txt) if mode == "e" else decode(txt)
+    print(out)
