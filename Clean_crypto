@@ -1,0 +1,460 @@
+#!/usr/bin/env python3
+"""
+Combo Clean Crypto — Streaming v2 (auditor‑friendly) with v1 compatibility
+---------------------------------------------------------------------------
+• v2: Streaming/chunked AES‑GCM with Argon2id (KDF params embedded + AAD)
+• Unique per‑chunk nonce derived from 12‑byte base_nonce + be32(counter)
+• Final HMAC-SHA256 binds the entire sequence (prevents reordering/truncation)
+• Constant memory (≈ chunk size) for arbitrarily large files
+• Atomic temp‑then‑rename writes; path recursion guard; progress option
+• v1 decryption compatibility (single‑blob format from “Combo Clean” v1)
+
+File format v2 (big‑endian); *Header is AAD for every chunk*:
+Header:
+  MAGIC(8)            = b"CCLEAN2\x00"
+  VERSION(u32)       = 2
+  SALT(16)
+  BASE_NONCE(12)     # 12 bytes; per‑chunk nonce = BASE_NONCE[:8] || be32(counter)
+  ARGON_TIME(u32)
+  ARGON_MEM_KiB(u32)
+  ARGON_PAR(u32)
+  CHUNK_SIZE(u32)
+  TOTAL_PLAIN_LEN(u64)  # known at encryption time (src size)
+  FLAGS(u32)            # reserved (0)
+
+Chunk record (repeats):
+  COUNTER(u32)           # 0..N-1
+  PLAIN_LEN(u32)         # last chunk may be < CHUNK_SIZE
+  CIPHERTEXT(PLAIN_LEN+16)
+    - nonce = BASE_NONCE[:8] || be32(COUNTER)
+    - AAD   = Header || COUNTER || PLAIN_LEN
+
+Footer:
+  TOTAL_CHUNKS(u32)
+  TOTAL_PLAIN_LEN(u64)   # must match header
+  STREAM_HMAC(32)        # HMAC-SHA256 over: Header || all chunk records || footer fixed fields
+
+Notes:
+- Key separation: enc_key = Argon2id(password, salt); mac_key = HKDF(enc_key, info=b"combo-clean-v2-mac").
+- On decryption we verify per‑chunk GCM AND final HMAC before renaming tmp → dst.
+"""
+from __future__ import annotations
+
+import argparse
+import getpass
+import hmac
+import io
+import os
+import pathlib
+import struct
+import sys
+from typing import Iterable, Optional
+
+from argon2.low_level import Type, hash_secret_raw
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+from cryptography.hazmat.primitives import hashes
+
+# ─── Constants ────────────────────────────────────────────────────────────────
+MAGIC_V1 = b"CCLEAN1\x00"  # from non‑streaming v1
+MAGIC_V2 = b"CCLEAN2\x00"
+VERSION_V1 = 1
+VERSION_V2 = 2
+
+SALT_LEN = 16
+NONCE_LEN = 12  # AES‑GCM nonce length
+TAG_LEN = 16
+
+# v1 header (after MAGIC): version,u32 | salt,16s | nonce,12s | t,u32 | m,u32 | p,u32
+V1_HEADER_FMT = ">I16s12sIII"
+V1_HEADER_SIZE = struct.calcsize(V1_HEADER_FMT)
+
+# v2 header (after MAGIC): see docstring
+V2_HEADER_FMT_A = ">I16s12sIII"   # version, salt, base_nonce, t, m, p
+V2_HEADER_FMT_B = ">IQI"          # chunk_size, total_plain_len, flags
+V2_HEADER_SIZE = struct.calcsize(V2_HEADER_FMT_A) + struct.calcsize(V2_HEADER_FMT_B)
+
+# v2 chunk record prefix
+REC_HDR_FMT = ">II"            # counter, plain_len
+REC_HDR_SIZE = struct.calcsize(REC_HDR_FMT)
+
+# v2 footer
+FOOTER_FMT = ">IQ32s"        # total_chunks, total_plain_len, hmac
+FOOTER_SIZE = struct.calcsize(FOOTER_FMT)
+
+# Defaults (can be overridden via CLI for encryption)
+ARGON_TIME = 3
+ARGON_MEM_KiB = 64 * 1024   # 64 MiB
+ARGON_PAR = 2
+CHUNK_SIZE_DEFAULT = 4 * 1024 * 1024  # 4 MiB
+CHUNK_SIZE_MIN = 64 * 1024
+CHUNK_SIZE_MAX = 64 * 1024 * 1024
+
+# ─── Utilities ────────────────────────────────────────────────────────────────
+
+def derive_key(password: str, salt: bytes, *, time_cost: int, mem_kib: int, parallelism: int) -> bytes:
+    return hash_secret_raw(
+        secret=password.encode("utf-8"),
+        salt=salt,
+        time_cost=time_cost,
+        memory_cost=mem_kib,
+        parallelism=parallelism,
+        hash_len=32,
+        type=Type.ID,
+    )
+
+
+def hkdf_mac_key(enc_key: bytes) -> bytes:
+    return HKDF(algorithm=hashes.SHA256(), length=32, salt=None, info=b"combo-clean-v2-mac").derive(enc_key)
+
+
+def nonce_for_chunk(base_nonce: bytes, counter: int) -> bytes:
+    if len(base_nonce) != NONCE_LEN:
+        raise ValueError("base_nonce must be 12 bytes")
+    if not (0 <= counter < (1 << 32)):
+        raise ValueError("chunk counter out of range (u32)")
+    return base_nonce[:8] + struct.pack(">I", counter)
+
+
+def walk_files(root: pathlib.Path) -> Iterable[pathlib.Path]:
+    for p in root.rglob("*"):
+        try:
+            if p.is_file() and not p.is_symlink():
+                yield p
+        except Exception:
+            continue
+
+
+def _validate_paths(src: pathlib.Path, dst: pathlib.Path):
+    s = src.resolve()
+    d = (dst if dst.exists() else dst.parent).resolve()
+    if d == s or d in s.parents:
+        raise ValueError("Destination directory cannot be inside source (would recurse)")
+
+
+# ─── v2: Streaming encrypt/decrypt ────────────────────────────────────────────
+
+def encrypt_file_v2(password: str, src: pathlib.Path, dst: pathlib.Path, *,
+                    time_cost: int, mem_kib: int, parallelism: int, chunk_size: int,
+                    show_progress: bool = False) -> None:
+    if not (CHUNK_SIZE_MIN <= chunk_size <= CHUNK_SIZE_MAX):
+        raise ValueError("chunk size out of allowed range")
+
+    salt = os.urandom(SALT_LEN)
+    base_nonce = os.urandom(NONCE_LEN)
+    enc_key = derive_key(password, salt, time_cost=time_cost, mem_kib=mem_kib, parallelism=parallelism)
+    mac_key = hkdf_mac_key(enc_key)
+
+    total_len = src.stat().st_size
+    header_a = struct.pack(V2_HEADER_FMT_A, VERSION_V2, salt, base_nonce, time_cost, mem_kib, parallelism)
+    header_b = struct.pack(V2_HEADER_FMT_B, chunk_size, total_len, 0)
+    header = MAGIC_V2 + header_a + header_b
+
+    aes = AESGCM(enc_key)
+    h = hmac.new(mac_key, digestmod="sha256")
+    h.update(header)
+
+    tmp = dst.with_suffix(dst.suffix + ".tmp")
+    with src.open("rb", buffering=0) as fin, tmp.open("wb", buffering=0) as fout:
+        fout.write(header)
+        remaining = total_len
+        counter = 0
+        processed = 0
+        while remaining > 0:
+            to_read = min(chunk_size, remaining)
+            chunk = fin.read(to_read)
+            if len(chunk) != to_read:
+                raise IOError("short read from source")
+            nonce = nonce_for_chunk(base_nonce, counter)
+            aad = header + struct.pack(REC_HDR_FMT, counter, len(chunk))
+            ct = aes.encrypt(nonce, chunk, aad)
+
+            rec = struct.pack(REC_HDR_FMT, counter, len(chunk)) + ct
+            fout.write(rec)
+            h.update(rec)
+
+            remaining -= to_read
+            processed += to_read
+            counter += 1
+            if counter == (1 << 32):
+                raise OverflowError("too many chunks for u32 counter")
+            if show_progress:
+                _print_progress(processed, total_len)
+
+        footer_fixed = struct.pack(">IQ", counter, total_len)
+        h.update(footer_fixed)
+        stream_mac = h.digest()
+        footer = footer_fixed + stream_mac
+        fout.write(footer)
+        fout.flush()
+        os.fsync(fout.fileno())
+
+    tmp.replace(dst)
+
+
+def decrypt_file_v2(password: str, src: pathlib.Path, dst: pathlib.Path, *, show_progress: bool = False) -> None:
+    # Read and parse header first
+    with src.open("rb", buffering=0) as fin:
+        head = fin.read(len(MAGIC_V2) + V2_HEADER_SIZE)
+        if len(head) < len(MAGIC_V2) + V2_HEADER_SIZE:
+            raise ValueError("Truncated v2 header")
+        if not head.startswith(MAGIC_V2):
+            raise ValueError("Not a v2 file (magic mismatch)")
+
+        # unpack header fields (skip MAGIC)
+        base = len(MAGIC_V2)
+        version, salt, base_nonce, t, m, p = struct.unpack(V2_HEADER_FMT_A, head[base: base + struct.calcsize(V2_HEADER_FMT_A)])
+        off = base + struct.calcsize(V2_HEADER_FMT_A)
+        chunk_size, total_len, flags = struct.unpack(V2_HEADER_FMT_B, head[off: off + struct.calcsize(V2_HEADER_FMT_B)])
+        if version != VERSION_V2:
+            raise ValueError(f"Unsupported v2 version: {version}")
+        if flags != 0:
+            raise ValueError("Unsupported flags set")
+        if not (CHUNK_SIZE_MIN <= chunk_size <= CHUNK_SIZE_MAX):
+            raise ValueError("chunk size out of allowed range in header")
+
+        enc_key = derive_key(password, salt, time_cost=t, mem_kib=m, parallelism=p)
+        mac_key = hkdf_mac_key(enc_key)
+        aes = AESGCM(enc_key)
+
+        # Setup HMAC and tmp out
+        h = hmac.new(mac_key, digestmod="sha256")
+        h.update(head)
+        tmp = dst.with_suffix(dst.suffix + ".tmp")
+        with tmp.open("wb", buffering=0) as fout:
+            processed = 0
+            # Determine file size to locate footer boundary
+            src_size = src.stat().st_size
+            # Position after header
+            pos = fin.tell()
+            footer_start = src_size - FOOTER_SIZE
+            if footer_start < pos:
+                raise ValueError("Truncated file (no room for footer)")
+
+            counter_expected = 0
+            while pos < footer_start:
+                # Read chunk record header
+                rec_hdr = fin.read(REC_HDR_SIZE)
+                if len(rec_hdr) != REC_HDR_SIZE:
+                    raise ValueError("Truncated chunk header")
+                counter, plain_len = struct.unpack(REC_HDR_FMT, rec_hdr)
+                if counter != counter_expected:
+                    raise ValueError("Out-of-order or missing chunk")
+                if plain_len < 0 or plain_len > chunk_size:
+                    raise ValueError("Invalid plain_len in chunk header")
+                # Read ciphertext (plain_len + TAG_LEN)
+                ct = fin.read(plain_len + TAG_LEN)
+                if len(ct) != plain_len + TAG_LEN:
+                    raise ValueError("Truncated ciphertext")
+
+                aad = head + rec_hdr
+                nonce = nonce_for_chunk(base_nonce, counter)
+                pt = aes.decrypt(nonce, ct, aad)
+                if len(pt) != plain_len:
+                    raise ValueError("Decrypted length mismatch")
+                fout.write(pt)
+
+                rec = rec_hdr + ct
+                h.update(rec)
+
+                processed += plain_len
+                counter_expected += 1
+                pos += REC_HDR_SIZE + len(ct)
+                if show_progress:
+                    _print_progress(processed, total_len)
+
+            # Read footer
+            footer = fin.read(FOOTER_SIZE)
+            if len(footer) != FOOTER_SIZE:
+                raise ValueError("Truncated footer")
+            total_chunks, total_plain_len_footer, mac = struct.unpack(FOOTER_FMT, footer)
+            h.update(struct.pack(">IQ", total_chunks, total_plain_len_footer))
+            if not hmac.compare_digest(h.digest(), mac):
+                raise ValueError("STREAM_HMAC verification failed")
+            if total_plain_len_footer != total_len:
+                raise ValueError("TOTAL_PLAIN_LEN mismatch (header vs footer)")
+            if total_chunks != counter_expected:
+                raise ValueError("TOTAL_CHUNKS mismatch")
+
+            fout.flush()
+            os.fsync(fout.fileno())
+    tmp.replace(dst)
+
+
+# ─── v1: Decrypt single‑blob format (from prior clean build) ─────────────────
+
+def decrypt_file_v1(password: str, src: pathlib.Path, dst: pathlib.Path) -> None:
+    blob = src.read_bytes()
+    if len(blob) < len(MAGIC_V1) + V1_HEADER_SIZE + TAG_LEN:
+        raise ValueError("Truncated v1 file")
+    if not blob.startswith(MAGIC_V1):
+        raise ValueError("Not a v1 file (magic mismatch)")
+
+    base = len(MAGIC_V1)
+    version, salt, nonce, t, m, p = struct.unpack(V1_HEADER_FMT, blob[base: base + V1_HEADER_SIZE])
+    if version != VERSION_V1:
+        raise ValueError(f"Unsupported v1 version: {version}")
+    header = blob[: base + V1_HEADER_SIZE]
+    ciphertext = blob[base + V1_HEADER_SIZE :]
+
+    key = derive_key(password, salt, time_cost=t, mem_kib=m, parallelism=p)
+    pt = AESGCM(key).decrypt(nonce, ciphertext, header)
+
+    tmp = dst.with_suffix(dst.suffix + ".tmp")
+    tmp.write_bytes(pt)
+    tmp.replace(dst)
+
+
+# ─── Directory helpers ───────────────────────────────────────────────────────
+
+def encrypt_directory_v2(password: str, src: pathlib.Path, dst: pathlib.Path, *,
+                         time_cost: int, mem_kib: int, parallelism: int, chunk_size: int,
+                         show_progress: bool = False) -> None:
+    _validate_paths(src, dst)
+    errors = []
+    for p in walk_files(src):
+        rel = p.relative_to(src)
+        outpath = dst / (rel.as_posix() + ".enc")
+        try:
+            outpath.parent.mkdir(parents=True, exist_ok=True)
+            encrypt_file_v2(password, p, outpath, time_cost=time_cost, mem_kib=mem_kib, parallelism=parallelism,
+                            chunk_size=chunk_size, show_progress=show_progress)
+        except Exception as e:
+            errors.append((str(p), str(e)))
+    if errors:
+        raise RuntimeError(f"{len(errors)} item(s) failed: " + "; ".join(f"{a}: {b}" for a, b in errors))
+
+
+def decrypt_directory_auto(password: str, src: pathlib.Path, dst: pathlib.Path, *, show_progress: bool = False) -> None:
+    _validate_paths(src, dst)
+    errors = []
+    for p in walk_files(src):
+        if p.suffix != ".enc":
+            continue
+        rel = p.relative_to(src)
+        outpath = dst / rel.with_suffix("")
+        try:
+            _decrypt_auto(password, p, outpath, show_progress=show_progress)
+        except Exception as e:
+            errors.append((str(p), str(e)))
+    if errors:
+        raise RuntimeError(f"{len(errors)} item(s) failed: " + "; ".join(f"{a}: {b}" for a, b in errors))
+
+
+# ─── CLI, plumbing ───────────────────────────────────────────────────────────
+
+def _print_progress(done: int, total: int):
+    if total <= 0:
+        return
+    pct = (done / total) * 100
+    sys.stderr.write(f"\rProgress: {pct:6.2f}%")
+    sys.stderr.flush()
+    if done == total:
+        sys.stderr.write("\n")
+
+
+def _fmt_choice(s: str) -> str:
+    s = s.lower()
+    if s not in {"v1", "v2"}:
+        raise argparse.ArgumentTypeError("--format must be v1 or v2")
+    return s
+
+
+def _pos_int(name: str, v: int) -> int:
+    if v <= 0:
+        raise argparse.ArgumentTypeError(f"{name} must be > 0")
+    return v
+
+
+def _decrypt_auto(password: str, src: pathlib.Path, dst: pathlib.Path, *, show_progress: bool = False) -> None:
+    # Peek magic
+    with src.open("rb") as f:
+        magic = f.read(8)
+    if magic == MAGIC_V2:
+        decrypt_file_v2(password, src, dst, show_progress=show_progress)
+    elif magic == MAGIC_V1:
+        decrypt_file_v1(password, src, dst)
+    else:
+        raise ValueError("Unknown file format (magic)")
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(
+        formatter_class=argparse.RawTextHelpFormatter,
+        description=__doc__,
+    )
+    ap.add_argument("mode", choices=["enc", "dec", "encdir", "decdir"], help="Operation mode")
+    ap.add_argument("src", help="Source file/dir")
+    ap.add_argument("dst", help="Destination file/dir")
+    ap.add_argument("--format", default="v2", type=_fmt_choice, help="Output format for encryption (v1 or v2) [default: v2]")
+    ap.add_argument("--argon-time", type=lambda x: _pos_int("argon-time", int(x)), default=ARGON_TIME,
+                    help=f"Argon2 time cost [default: {ARGON_TIME}]")
+    ap.add_argument("--argon-mb", type=lambda x: _pos_int("argon-mb", int(x)), default=ARGON_MEM_KiB // 1024,
+                    help=f"Argon2 memory (MiB) [default: {ARGON_MEM_KiB // 1024}]")
+    ap.add_argument("--argon-par", type=lambda x: _pos_int("argon-par", int(x)), default=ARGON_PAR,
+                    help=f"Argon2 parallelism [default: {ARGON_PAR}]")
+    ap.add_argument("--chunk-mb", type=lambda x: _pos_int("chunk-mb", int(x)), default=CHUNK_SIZE_DEFAULT // (1024 * 1024),
+                    help=f"Chunk size in MiB for v2 [default: {CHUNK_SIZE_DEFAULT // (1024 * 1024)}]")
+    ap.add_argument("--progress", action="store_true", help="Show progress to stderr")
+    ap.add_argument("-p", "--password", help="Password (omit to be prompted)")
+    ap.add_argument("--no-confirm", action="store_true", help="Skip password confirmation on encrypt")
+    args = ap.parse_args()
+
+    src = pathlib.Path(args.src)
+    dst = pathlib.Path(args.dst)
+
+    mem_kib = args.argon_mb * 1024
+    chunk_size = args.chunk_mb * 1024 * 1024
+
+    if args.password:
+        pwd = args.password
+    else:
+        pwd = getpass.getpass("🔒 Password: ")
+        if args.mode in {"enc", "encdir"} and not args.no_confirm:
+            confirm = getpass.getpass("🔒 Confirm : ")
+            if confirm != pwd:
+                print("[ERROR] Passwords do not match.")
+                sys.exit(1)
+
+    try:
+        if args.mode == "enc":
+            if args.format == "v1":
+                # v1 encryption (single‑blob) for compatibility with older tooling
+                salt = os.urandom(SALT_LEN)
+                nonce = os.urandom(NONCE_LEN)
+                key = derive_key(pwd, salt, time_cost=args.argon_time, mem_kib=mem_kib, parallelism=args.argon_par)
+                header = MAGIC_V1 + struct.pack(V1_HEADER_FMT, VERSION_V1, salt, nonce, args.argon_time, mem_kib, args.argon_par)
+                data = src.read_bytes()
+                ct = AESGCM(key).encrypt(nonce, data, header)
+                tmp = dst.with_suffix(dst.suffix + ".tmp")
+                tmp.write_bytes(header + ct)
+                tmp.replace(dst)
+                print(f"🔥 Encrypted (v1) {src} → {dst}")
+            else:
+                encrypt_file_v2(pwd, src, dst, time_cost=args.argon_time, mem_kib=mem_kib, parallelism=args.argon_par,
+                                chunk_size=chunk_size, show_progress=args.progress)
+                print(f"🔥 Encrypted (v2) {src} → {dst}")
+        elif args.mode == "dec":
+            _decrypt_auto(pwd, src, dst, show_progress=args.progress)
+            print(f"✅ Decrypted {src} → {dst}")
+        elif args.mode == "encdir":
+            if args.format != "v2":
+                raise ValueError("Directory mode only supports v2 streaming for new encrypts")
+            encrypt_directory_v2(pwd, src, dst, time_cost=args.argon_time, mem_kib=mem_kib, parallelism=args.argon_par,
+                                 chunk_size=chunk_size, show_progress=args.progress)
+            print(f"🔥 Directory encrypted (v2) → {dst}")
+        else:  # decdir
+            decrypt_directory_auto(pwd, src, dst, show_progress=args.progress)
+            print(f"✅ Directory decrypted → {dst}")
+    except Exception as e:
+        # Be explicit about partial tmp file when relevant
+        print(f"[ERROR] {e}")
+        if args.mode in {"enc", "dec"}:
+            tmp = dst.with_suffix(dst.suffix + ".tmp")
+            if tmp.exists():
+                print(f"[INFO] Partial output left at {tmp.resolve()}")
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
